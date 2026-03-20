@@ -2,7 +2,7 @@ import re
 import streamlit as st
 from agent import parse_task
 from jira_client import create_issue, fetch_projects, fetch_issue_types
-
+from actions import dispatch
 
 def extract_domain(raw: str) -> str:
     """Extract bare Jira subdomain from a URL, full domain, or plain name."""
@@ -26,7 +26,7 @@ def guess_domain_from_email(email: str) -> str:
 st.set_page_config(
     page_title="Jira AI Agent",
     page_icon="🤖",
-    layout="centered",
+    layout="wide",
 )
 
 # ── Custom CSS ────────────────────────────────────────────────────────────────
@@ -115,9 +115,8 @@ if "messages" not in st.session_state:
             "role": "assistant",
             "content": (
                 "👋 Hi! I'm your **Jira AI Agent**.\n\n"
-                "Describe a task in plain English and I'll parse it with **LLaMA 3.3 70B** "
-                "and create a Jira issue instantly.\n\n"
-                "_Fill in your credentials in the sidebar, then click **Fetch Projects** to load your projects._"
+                "I can **create, update, search, transition, and manage** your Jira tasks using plain English.\n\n"
+                "_Fill in your credentials in the sidebar, then click **Fetch Projects** to start!_"
             ),
         }
     ]
@@ -209,28 +208,25 @@ with st.sidebar:
     is_ready = all([groq_key, jira_email, jira_token, jira_domain, selected_project_key])
 
     st.divider()
-    with st.expander("ℹ️ How to get credentials", expanded=False):
+    with st.expander("💬 Examples of what you can ask", expanded=False):
         st.markdown("""
-**Groq API Key**
-Visit [console.groq.com](https://console.groq.com) → API Keys → Create Key
-
-**Jira API Token**
-Visit [Atlassian security settings](https://id.atlassian.com/manage-profile/security/api-tokens)
-→ Create API token
-
-**Jira Domain** *(auto-detected)*
-We guess it from your email. If wrong, correct it or paste your full Jira URL like `https://mycompany.atlassian.net`.
+- *Create a bug for the login crash, high priority*
+- *Assign PROJ-123 to Yash*
+- *Move PROJ-45 to In Progress*
+- *Search for all open bugs*
+- *Add a comment to PROJ-8: tested and working*
+- *Delete PROJ-9*
         """)
 
 # ── Page header ───────────────────────────────────────────────────────────────
-st.markdown("## 🚀 Jira AI Agent")
+st.markdown("## 🚀 Jira Full Agent")
 st.markdown(
-    "Describe any task in natural language — the agent extracts the details "
-    "and creates a Jira ticket automatically."
+    "Describe what you want to do (create, update, search, comment, assign...) "
+    "and the AI will figure out the rest."
 )
 
 if selected_project_key:
-    st.info(f"🎯 Creating issues in **{selected_project_key}**")
+    st.info(f"🎯 Working in project: **{selected_project_key}**")
 
 st.divider()
 
@@ -241,7 +237,7 @@ for msg in st.session_state.messages:
 
 # ── Chat input ────────────────────────────────────────────────────────────────
 placeholder = (
-    "Describe your task… e.g. 'Fix the login page crash on mobile — it's urgent'"
+    "What would you like to do? e.g. 'Create a bug' or 'Assign PROJ-5 to me'"
     if is_ready else
     "Fill credentials & fetch projects in the sidebar first…"
 )
@@ -252,48 +248,27 @@ if prompt := st.chat_input(placeholder, disabled=not is_ready):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("🧠 Parsing with LLaMA → 🔧 Creating Jira issue…"):
+        with st.spinner("🧠 Parsing with LLaMA → 🔧 Executing Jira Action…"):
             try:
                 parsed = parse_task(
                     prompt, groq_key,
                     valid_issue_types=st.session_state.issue_types or None,
                 )
-                result = create_issue(
-                    jira_domain.strip(),
-                    jira_email.strip(),
-                    jira_token.strip(),
-                    selected_project_key,
-                    parsed,
-                )
-                key = result["key"]
-                browse_url = result["url"]
-
-                priority_emoji = {
-                    "Highest": "🔴", "High": "🟠",
-                    "Medium": "🟡", "Low": "🔵", "Lowest": "⚪"
-                }.get(parsed.get("priority", "Medium"), "🟡")
-
-                type_emoji = {
-                    "Bug": "🐛", "Story": "📖",
-                    "Task": "✅", "Improvement": "⚡"
-                }.get(parsed.get("issuetype", "Task"), "✅")
-
-                reply = f"""✅ **Issue created successfully!**
-
-| Field | Value |
-|---|---|
-| 🎫 **Key** | `{key}` |
-| 📝 **Summary** | {parsed.get('summary', '')} |
-| {type_emoji} **Type** | {parsed.get('issuetype', 'Task')} |
-| {priority_emoji} **Priority** | {parsed.get('priority', 'Medium')} |
-{f"| 📅 **Due Date** | {parsed['due_date']} |" if parsed.get('due_date') else ""}
-{f"| 🏷️ **Labels** | {', '.join(parsed['labels'])} |" if parsed.get('labels') else ""}
-{f"| 👤 **Assignee** | {parsed['assignee_name']} |" if parsed.get('assignee_name') else ""}
-
-> 📄 **Description**: {parsed.get('description', '_No description_') or '_No description_'}
-
-🔗 [**Open {key} in Jira ↗**]({browse_url})
-"""
+                
+                action = parsed.get("action")
+                params = parsed.get("params", {})
+                
+                if not action:
+                    reply = "❌ **Error**: LLaMA didn't return a valid action. Try rephrasing."
+                else:
+                    reply = dispatch(
+                        action,
+                        params,
+                        jira_domain.strip(),
+                        jira_email.strip(),
+                        jira_token.strip(),
+                        selected_project_key
+                    )
 
             except Exception as e:
                 msg = str(e)
