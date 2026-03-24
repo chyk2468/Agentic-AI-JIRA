@@ -1,8 +1,13 @@
 import re
+import os
 import streamlit as st
+from dotenv import load_dotenv
 from agent import parse_task
-from jira_client import create_issue, fetch_projects, fetch_issue_types
+from jira_client import create_issue, fetch_projects, fetch_issue_types, fetch_all_project_issues
 from actions import dispatch
+from vector_store import sync_project_issues, search_similar_issues
+
+load_dotenv() # Load from .env file
 
 def extract_domain(raw: str) -> str:
     """Extract bare Jira subdomain from a URL, full domain, or plain name."""
@@ -109,6 +114,8 @@ if "issue_types" not in st.session_state:
     st.session_state.issue_types = []        # valid issue types for selected project
 if "projects_error" not in st.session_state:
     st.session_state.projects_error = ""
+if "pending_actions" not in st.session_state:
+    st.session_state.pending_actions = []
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {
@@ -129,17 +136,18 @@ with st.sidebar:
 
     st.subheader("⚙️ Credentials")
 
-    groq_key   = st.text_input("Groq API Key",   type="password", placeholder="gsk_...")
-    jira_email = st.text_input("Jira Email",      placeholder="you@example.com")
-    jira_token = st.text_input("Jira API Token", type="password", placeholder="ATATT3...")
+    groq_key   = st.text_input("Groq API Key",   type="password", value=os.getenv("GROQ_API_KEY", ""), placeholder="gsk_...")
+    jira_email = st.text_input("Jira Email",      value=os.getenv("JIRA_EMAIL", ""), placeholder="you@example.com")
+    jira_token = st.text_input("Jira API Token", type="password", value=os.getenv("JIRA_API_KEY", ""), placeholder="ATATT3...")
 
     # ── Auto-suggest domain from email ───────────────────────────────────────
+    env_domain = os.getenv("JIRA_DOMAIN", "")
     suggested = guess_domain_from_email(jira_email) if jira_email else ""
     raw_domain = st.text_input(
         "Jira Domain  *(auto-detected — edit if wrong)*",
-        value=suggested,
+        value=env_domain or suggested,
         placeholder="e.g. mycompany  or paste your full Jira URL",
-        help="We guessed this from your email. You can also paste the full URL like https://mycompany.atlassian.net",
+        help="We guessed this from your email or loaded from .env. You can also paste the full URL like https://mycompany.atlassian.net",
     )
     jira_domain = extract_domain(raw_domain) if raw_domain.strip() else ""
 
@@ -198,6 +206,17 @@ with st.sidebar:
 
         if st.session_state.issue_types:
             st.caption(f"🗂 Valid types: {', '.join(st.session_state.issue_types)}")
+            
+        st.divider()
+        if st.button("📥 Sync Project to AI Vector Memory"):
+            with st.spinner("Downloading tickets and generating embeddings..."):
+                try:
+                    issues = fetch_all_project_issues(jira_domain, jira_email, jira_token, selected_project_key)
+                    count = sync_project_issues(selected_project_key, issues)
+                    st.success(f"Successfully synced {count} issues to local Vector DB!")
+                except Exception as e:
+                    st.error(f"Failed to sync: {e}")
+
     else:
         if creds_ready:
             st.info("👆 Click **Fetch My Projects** to load your Jira projects.")
@@ -242,48 +261,79 @@ placeholder = (
     "Fill credentials & fetch projects in the sidebar first…"
 )
 
-if prompt := st.chat_input(placeholder, disabled=not is_ready):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+if not st.session_state.pending_actions:
+    if prompt := st.chat_input(placeholder, disabled=not is_ready):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-    with st.chat_message("assistant"):
-        with st.spinner("🧠 Parsing with LLaMA → 🔧 Executing Jira Action…"):
-            try:
-                parsed = parse_task(
-                    prompt, groq_key,
-                    valid_issue_types=st.session_state.issue_types or None,
-                )
-                
-                action = parsed.get("action")
-                params = parsed.get("params", {})
-                
-                if not action:
-                    reply = "❌ **Error**: LLaMA didn't return a valid action. Try rephrasing."
-                else:
-                    reply = dispatch(
-                        action,
-                        params,
-                        jira_domain.strip(),
-                        jira_email.strip(),
-                        jira_token.strip(),
-                        selected_project_key
+        with st.chat_message("assistant"):
+            with st.spinner("🧠 Extracting tasks with LLaMA…"):
+                try:
+                    history = st.session_state.messages[:-1] 
+                    context_issues = []
+                    if selected_project_key:
+                        context_issues = search_similar_issues(selected_project_key, prompt, n_results=3)
+
+                    parsed_list = parse_task(
+                        prompt, groq_key,
+                        valid_issue_types=st.session_state.issue_types or None,
+                        chat_history=history,
+                        context_issues=context_issues
                     )
+                    
+                    st.session_state.pending_actions = parsed_list
+                    st.rerun()
 
-            except Exception as e:
-                msg = str(e)
-                if "401" in msg:
-                    hint = "Check your Jira email and API token."
-                elif "404" in msg:
-                    hint = "Check your domain and project key."
-                elif "400" in msg:
-                    hint = "Jira rejected the payload — try a different issue type or check project settings."
-                else:
-                    hint = "Check all configuration fields in the sidebar."
-                reply = f"❌ **Error**: {msg}\n\n💡 **Hint**: {hint}"
+                except Exception as e:
+                    msg = str(e)
+                    st.markdown(f"❌ **Error extracting tasks**: {msg}")
 
-        st.markdown(reply)
-    st.session_state.messages.append({"role": "assistant", "content": reply})
+if st.session_state.pending_actions:
+    st.info("📋 **Action Approval Required:** Please review the detected tasks below.")
+    with st.form("approval_queue_form"):
+        selected_indices = []
+        for i, act in enumerate(st.session_state.pending_actions):
+            action_type = act.get("action", "UNKNOWN")
+            params = act.get("params", {})
+            
+            if action_type == "create_issue": desc = f"Create {params.get('issuetype', 'Issue')}: {params.get('summary')}"
+            elif action_type == "search_issues": desc = f"Search: {params.get('jql')}"
+            elif action_type == "update_issue": desc = f"Update {params.get('issue_key')}"
+            elif action_type == "add_comment": desc = f"Comment on {params.get('issue_key')}"
+            elif action_type == "answer_question": desc = "Provide Answer"
+            else: desc = f"Target: {params.get('issue_key', '')}"
+            
+            label = f"**{action_type.upper()}**: {desc}"
+            if st.checkbox(label, value=True, key=f"action_{i}"):
+                selected_indices.append(i)
+                
+        col1, col2, _ = st.columns([2, 2, 6])
+        submit = col1.form_submit_button("✅ Execute Selected")
+        cancel = col2.form_submit_button("❌ Cancel")
+        
+        if submit:
+            with st.spinner("🔧 Executing Jira Actions…"):
+                replies = []
+                for idx in selected_indices:
+                    act = st.session_state.pending_actions[idx]
+                    action = act.get("action")
+                    params = act.get("params", {})
+                    try:
+                        reply = dispatch(action, params, jira_domain.strip(), jira_email.strip(), jira_token.strip(), selected_project_key)
+                        replies.append(reply)
+                    except Exception as e:
+                        replies.append(f"❌ **Error executing {action}**: {e}")
+                
+                final_reply = "\n\n---\n\n".join(replies) if replies else "No actions selected."
+                st.session_state.messages.append({"role": "assistant", "content": final_reply})
+                st.session_state.pending_actions = []
+                st.rerun()
+                
+        if cancel:
+            st.session_state.messages.append({"role": "assistant", "content": "🚫 *Actions cancelled by user.*"})
+            st.session_state.pending_actions = []
+            st.rerun()
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.divider()

@@ -135,3 +135,20 @@ def assign_issue(domain: str, email: str, token: str, issue_key: str, assignee_n
         jira.assign_issue(issue_key, users[0].accountId)
         return True
     raise ValueError(f"User '{assignee_name}' not found")
+
+def fetch_all_project_issues(domain: str, email: str, token: str, project_key: str) -> list[dict]:
+    """Retrieve up to 100 recent issues from a project to populate the Vector DB."""
+    jira = _client(domain, email, token)
+    jql = f"project = {project_key} ORDER BY created DESC"
+    issues = jira.search_issues(jql, maxResults=100)
+    
+    docs = []
+    for issue in issues:
+        docs.append({
+            "key": issue.key,
+            "summary": issue.fields.summary,
+            "description": getattr(issue.fields, 'description', '') or "",
+            "status": issue.fields.status.name,
+            "assignee_name": issue.fields.assignee.displayName if issue.fields.assignee else None
+        })
+    return docs

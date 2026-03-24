@@ -74,6 +74,9 @@ def dispatch(action: str, params: dict, domain: str, email: str, token: str, pro
             jira_client.delete_issue(domain, email, token, params["issue_key"])
             return f"🗑️ **Deleted {params['issue_key']}** forever. Hope you meant to do that!"
 
+        elif action == "answer_question":
+            return f"🧠 **Answer:**\n\n{params.get('answer', 'I am not sure.')}"
+
         else:
             return f"⚠️ **Unknown action:** {action}"
 
